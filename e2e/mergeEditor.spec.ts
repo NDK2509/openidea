@@ -15,11 +15,10 @@ async function mountMerge(
   page: Page,
   versions: [string | null, string | null, string | null] = [BASE, OURS, THEIRS],
   failure: string | null = null,
-  binary = false,
 ) {
   await page.goto("/");
   await page.evaluate(
-    async ({ versions: [base, ours, theirs], failure, binary }) => {
+    async ({ versions: [base, ours, theirs], failure }) => {
       const reactPath = "/node_modules/.vite/deps/react.js";
       const domPath = "/node_modules/.vite/deps/react-dom_client.js";
       const react = await import(reactPath);
@@ -38,7 +37,6 @@ async function mountMerge(
           : {
               status: "ok",
               data: {
-                binary,
                 base,
                 ours,
                 theirs,
@@ -55,9 +53,9 @@ async function mountMerge(
         createElement(MergeEditor, { input: { key: "merge:demo.ts", data: { path: "/project/demo.ts" } } }),
       );
     },
-    { versions, failure, binary },
+    { versions, failure },
   );
-  if (!failure && !binary)
+  if (!failure && !versions.some((text) => text?.includes("\0")))
     await expect(page.getByRole("region", { name: "Result" }).locator(".cm-content")).toBeVisible();
 }
 
@@ -103,34 +101,22 @@ test("merge controls and pane titles fit while resizing the result", async ({ pa
   await expect.poll(() => text(result(page))).toContain("\nmine\n");
 });
 
-/**
- * Capture the Git boundary, keeping real editor state, dialogs and Apply behavior. Apply writes
- * the file through its document, which the page keeps in memory.
- */
+/** Capture the save boundary, keeping real editor state, dialogs and Apply behavior. */
 async function captureWrites(page: Page) {
   await page.evaluate(async () => {
     const ipcPath = "/src/platform/ipc.ts";
-    const backendPath = "/src/editor/core/backend.ts";
     const { commands } = await import(ipcPath);
-    const { docBackend } = await import(backendPath);
-    docBackend().files.set("/project/demo.ts", "working copy\n");
     const calls: { command: string; args: unknown[] }[] = [];
     Object.assign(window, { mergeWrites: calls });
-    for (const command of ["vcsAcceptConflictSide", "vcsStage"])
+    commands.fsReadText = async () => ({ status: "ok", data: "working copy\n" });
+    commands.docOpen = async () => ({ status: "ok", data: { id: 777, version: 1 } });
+    for (const command of ["docEdit", "docSave", "docClose", "fsDelete", "vcsStage"])
       commands[command] = async (...args: unknown[]) => {
         calls.push({ command, args });
         return { status: "ok", data: null };
       };
   });
 }
-
-/** The text Apply saved to the file. */
-const saved = (page: Page) =>
-  page.evaluate(async () => {
-    const backendPath = "/src/editor/core/backend.ts";
-    const { docBackend } = await import(backendPath);
-    return docBackend().files.get("/project/demo.ts") as string;
-  });
 
 const writes = (page: Page) =>
   page.evaluate(
@@ -142,7 +128,7 @@ const writes = (page: Page) =>
       ).mergeWrites,
   );
 
-test("Apply saves a CRLF resolution with UTF-16 text as resolved", async ({ page }) => {
+test("CRLF resolutions use UTF-16 editor positions and preserve line endings on Apply", async ({ page }) => {
   const base = "标题😀\r\nunchanged\r\nbase\r\ntail";
   const ours = base.replace("base", "左侧🚀");
   await mountMerge(page, [base, ours, base.replace("base", "右侧🧪")]);
@@ -156,9 +142,8 @@ test("Apply saves a CRLF resolution with UTF-16 text as resolved", async ({ page
   await page.locator("#merge-host").getByRole("button", { name: "Apply", exact: true }).click();
   await expect.poll(async () => (await writes(page)).some((call) => call.command === "vcsStage")).toBe(true);
   const calls = await writes(page);
-  expect(calls.map((call) => call.command)).toEqual(["vcsStage"]);
-  // Documents keep `\n`; saving writes the file's own line ending.
-  expect(await saved(page)).toBe(ours.replace(/\r\n/g, "\n"));
+  expect(calls.map((call) => call.command)).toEqual(["docEdit", "docSave", "docClose", "vcsStage"]);
+  expect(calls[0]!.args[2]).toEqual({ changes: [{ from: 0, to: 13, insert: ours }] });
 });
 
 test("Apply writes and stages unresolved text only after confirmation", async ({ page }) => {
@@ -172,7 +157,7 @@ test("Apply writes and stages unresolved text only after confirmation", async ({
   await apply.click();
   await page.getByRole("button", { name: "Mark Resolved", exact: true }).click();
   await expect.poll(async () => (await writes(page)).some((call) => call.command === "vcsStage")).toBe(true);
-  expect(await saved(page)).toBe(BASE);
+  expect((await writes(page))[0]!.args[2]).toEqual({ changes: [{ from: 0, to: 13, insert: BASE }] });
 });
 
 test("footer buttons work when a click doesn't focus them, as in WebKit", async ({ page }) => {
@@ -192,16 +177,10 @@ test("footer buttons work when a click doesn't focus them, as in WebKit", async 
   await expect(page.getByRole("dialog")).toContainText("Save and mark the file as resolved anyway?");
 });
 
-test("binary conflicts offer whole-file acceptance and unreadable versions can be retried", async ({ page }) => {
-  await mountMerge(page, [null, null, null], null, true);
-  const host = page.locator("#merge-host");
-  await expect(host).toContainText("Binary file. Choose which version to keep.");
-  await expect(host.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
-  await captureWrites(page);
-  await host.getByRole("button", { name: "Accept Yours", exact: true }).click();
-  await expect
-    .poll(() => writes(page))
-    .toEqual([{ command: "vcsAcceptConflictSide", args: [["/project/demo.ts"], "ours"] }]);
+test("binary and unreadable versions show an error with no Apply controls", async ({ page }) => {
+  await mountMerge(page, ["\0base", "\0ours", "\0theirs"]);
+  await expect(page.locator("#merge-host")).toContainText("Binary files cannot be resolved in the merge editor.");
+  await expect(page.locator("#merge-host").getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
   await mountMerge(page, [BASE, OURS, THEIRS], "Cannot read conflict versions");
   await expect(page.locator("#merge-host")).toContainText("Cannot read conflict versions");
   await expect(page.locator("#merge-host").getByRole("button", { name: "Retry", exact: true })).toBeVisible();
@@ -220,13 +199,15 @@ test("per-change controls also work from the keyboard", async ({ page }) => {
   await expect(status(page)).toHaveText("2 changes left, 1 conflict");
 });
 
-test("accepting a deleted version delegates removal and staging to Git", async ({ page }) => {
+test("accepting a deleted version removes the file before staging", async ({ page }) => {
   await mountMerge(page, [BASE, OURS, null]);
   await captureWrites(page);
   await page.locator("#merge-host").getByRole("button", { name: "Accept Theirs", exact: true }).click();
-  await expect
-    .poll(() => writes(page))
-    .toEqual([{ command: "vcsAcceptConflictSide", args: [["/project/demo.ts"], "theirs"] }]);
+  await expect.poll(async () => (await writes(page)).some((call) => call.command === "vcsStage")).toBe(true);
+  expect(await writes(page)).toEqual([
+    { command: "fsDelete", args: ["/project/demo.ts"] },
+    { command: "vcsStage", args: [["/project/demo.ts"]] },
+  ]);
 });
 
 test("a long side shows only the lines it changed against the base", async ({ page }) => {
@@ -234,12 +215,13 @@ test("a long side shows only the lines it changed against the base", async ({ pa
   const base = Array.from({ length: 2000 }, (_, i) => `"node_modules/pkg-${i}": "1.0.${i}",`);
   const bump = (at: number) => lines(...base.map((l, i) => (i % 100 === at ? l.replace('"1.0.', '"2.0.') : l)));
   await mountMerge(page, [lines(...base), bump(3), bump(50)]);
-  for (const [name, line] of [
-    ["Your version", 3],
-    ["Their version", 50],
+  for (const [name, line, unchanged] of [
+    ["Your version", 3, 4],
+    ["Their version", 50, 51],
   ] as const) {
-    const deleted = page.getByRole("region", { name }).locator(".cm-deletedChunk").first().locator(".cm-deletedLine");
-    await expect(deleted).toHaveText([base[line]!]);
+    const region = page.getByRole("region", { name });
+    await expect(region.locator(".cm-mergeLine").first()).toContainText(`"node_modules/pkg-${line}": "2.0.${line}",`);
+    await expect(region.locator(".cm-line", { hasText: `"pkg-${unchanged}"` })).toHaveCount(0);
   }
 });
 
@@ -490,45 +472,131 @@ test("difference navigation focuses and centres the merge result caret with sync
   await check(101);
 });
 
-test("scrolling one pane sideways scrolls the other two to the same offset", async ({ page }) => {
-  await page.setViewportSize({ width: 900, height: 600 });
-  const long = (tag: string) => `const ${tag} = "${"x".repeat(400)}";`;
-  await mountMerge(page, [
-    lines(long("base"), "a", "b"),
-    lines(long("ours"), "a", "b"),
-    lines(long("theirs"), "a", "b"),
-  ]);
-  const lefts = () =>
-    page
-      .locator("#merge-host .cm-scroller")
-      .evaluateAll((els) => els.map((el) => Math.round((el as HTMLElement).scrollLeft)));
-  for (const pane of ["Your version", "Result", "Their version"]) {
-    const offset = pane === "Result" ? 240 : pane === "Your version" ? 120 : 60;
-    await page
-      .getByRole("region", { name: pane })
-      .locator(".cm-scroller")
-      .evaluate((el, x) => (el.scrollLeft = x), offset);
-    await expect.poll(lefts).toEqual([offset, offset, offset]);
-  }
-});
-
-test("says when every change is processed and saves the result from the notice", async ({ page }) => {
+test("uses IntelliJ-style facing gutters, toolbar controls, and resolves conflicts via Merge by Agent", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 760 });
   await mountMerge(page);
-  await captureWrites(page);
-  const notice = page.locator("#merge-host").getByText("All changes have been processed.");
-  await expect(notice).toBeHidden();
-  await page.getByRole("button", { name: "Resolve Simple Conflicts" }).click();
-  await expect(status(page)).toHaveText("1 change left, 1 conflict");
-  await expect(notice).toBeHidden();
-  // The conflict left takes both sides.
-  await page.getByRole("region", { name: "Your version" }).locator(".cm-merge-accept").first().click();
-  await expect(notice).toBeHidden();
-  await page.getByRole("region", { name: "Their version" }).locator(".cm-merge-accept").first().click();
+  const host = page.locator("#merge-host");
+
+  // Mirrored left gutter facing Result (`×` then `>>`), right gutter facing Result (`<<` then `×`).
+  const ours = page.getByRole("region", { name: "Your version" });
+  const theirs = page.getByRole("region", { name: "Their version" });
+  await expect(ours.locator(".cm-gutters-after .cm-merge-gutter")).toBeVisible();
+  const leftFirstOp = await ours.locator(".cm-merge-ops").first().locator("button").first().getAttribute("class");
+  expect(leftFirstOp).toContain("cm-merge-ignore");
+  const rightFirstOp = await theirs.locator(".cm-merge-ops").first().locator("button").first().getAttribute("class");
+  expect(rightFirstOp).toContain("cm-merge-accept");
+
+  // Result has a wand for word-resolvable conflict and an Agent button for real conflict.
+  await expect(result(page).locator(".cm-merge-wand")).toHaveCount(1);
+  await expect(result(page).locator(".cm-merge-agent")).toHaveCount(1);
+  await expect(host.getByText("Apply non-conflicting changes:")).toBeVisible();
+  await expect(host.getByRole("button", { name: "Ignore whitespace" })).toBeVisible();
+  await expect(host.getByRole("button", { name: "Highlighting" })).toBeVisible();
+  await expect(host.getByRole("button", { name: "Synchronize Scrolling" })).toHaveAttribute("aria-pressed", "true");
+
+  // Mock coding agent provider and quiet task execution.
+  await page.evaluate(async () => {
+    const ipcPath = "/src/platform/ipc.ts";
+    const storePath = "/src/features/agents/store.ts";
+    const ipc = await import(ipcPath);
+    const agentsStore = await import(storePath);
+    agentsStore.useAgents.setState({
+      providers: [
+        {
+          id: "claude",
+          name: "Claude Code",
+          installed: true,
+          config: [],
+          thoughtLevels: {},
+          commands: [],
+          supportsImages: false,
+          supportsWorktree: false,
+          source: "builtin",
+        } as never,
+      ],
+      tasks: new Map(),
+    });
+    const cmds = ipc.commands as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    cmds.agentCreate = async () => {
+      setTimeout(() => {
+        agentsStore.useAgents.setState((s: { tasks: Map<string, unknown> }) => ({
+          tasks: new Map(s.tasks).set("agent-merge-1", {
+            id: "agent-merge-1",
+            title: "Resolve merge conflicts",
+            provider: "claude",
+            model: null,
+            status: "ready",
+            isolation: "local",
+            cwd: "/project",
+            branch: null,
+            base: null,
+            baseCommit: null,
+            error: null,
+            createdMs: 0,
+            updatedMs: 0,
+            config: [],
+            commands: [],
+            usage: null,
+            queue: [],
+          }),
+        }));
+      }, 20);
+      return {
+        status: "ok",
+        data: {
+          id: "agent-merge-1",
+          title: "Resolve merge conflicts",
+          provider: "claude",
+          model: null,
+          status: "starting",
+          isolation: "local",
+          cwd: "/project",
+          branch: null,
+          base: null,
+          baseCommit: null,
+          error: null,
+          createdMs: 0,
+          updatedMs: 0,
+          config: [],
+          commands: [],
+          usage: null,
+          queue: [],
+        },
+      };
+    };
+    cmds.agentEntries = async () => ({
+      status: "ok",
+      data: [
+        { type: "user", text: "resolve", attachments: [] },
+        {
+          type: "agent",
+          text: [
+            '<resolved id="0">',
+            "const total = cost + fee;",
+            "</resolved>",
+            '<resolved id="2">',
+            "merged",
+            "</resolved>",
+            "<summary>Combined both branches cleanly.</summary>",
+          ].join("\n"),
+        },
+      ],
+    });
+    cmds.agentCancel = async () => ({ status: "ok", data: null });
+    cmds.agentDelete = async () => ({ status: "ok", data: null });
+  });
+
+  await host.getByRole("button", { name: "Merge by Agent" }).click();
+  await expect(host.getByText("Combined both branches cleanly.")).toBeVisible();
   await expect(status(page)).toHaveText("All changes processed");
-  await expect(notice).toBeVisible();
-  await page.screenshot({ path: process.env.MERGE_SHOT, animations: "disabled" }).catch(() => undefined);
-  await page.getByRole("button", { name: "Save changes and finish merging" }).click();
-  // Nothing is left to confirm: the result is written and staged.
-  await expect.poll(async () => (await writes(page)).some((call) => call.command === "vcsStage")).toBe(true);
-  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const merged = await text(result(page));
+  expect(merged).toContain("const total = cost + fee;");
+  expect(merged).toContain("\nC\n");
+  expect(merged).toContain("\nmerged\n");
+
+  await host.getByRole("button", { name: "Undo", exact: true }).click();
+  await expect(status(page)).toHaveText("3 changes left, 2 conflicts");
+  expect((await text(result(page))).trimEnd()).toBe(BASE.trimEnd());
 });

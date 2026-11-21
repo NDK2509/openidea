@@ -2,9 +2,11 @@ import { history, redo, undo } from "@codemirror/commands";
 import { EditorState, Transaction, type TransactionSpec } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 import {
+  applyAgentResolutions,
   applyNonConflicting,
   applyTo,
   canApply,
+  changeType,
   changesIn,
   changesInSide,
   hasNonConflicting,
@@ -14,6 +16,7 @@ import {
   mergeHistory,
   resolveSimple,
   revertResolved,
+  sideChangeType,
   startMerge,
   summarize,
   unresolved,
@@ -389,5 +392,54 @@ describe("summary", () => {
       simple: false,
       revert: true,
     });
+  });
+});
+
+describe("change types, whitespace ignore policy, and agent resolutions", () => {
+  it("classifies conflict, modified, inserted, and deleted hunks", () => {
+    const m = merge(
+      lines("a", "ins", "b", "L", "c", "d"),
+      lines("a", "b", "base", "c", "d"),
+      lines("a", "b", "R", "c"),
+    );
+    expect(m.changes.map((c) => changeType(c))).toEqual(["inserted", "conflict", "deleted"]);
+    expect(sideChangeType(m.changes[0]!, "left")).toBe("inserted");
+    expect(sideChangeType(m.changes[1]!, "left")).toBe("conflict");
+    expect(sideChangeType(m.changes[2]!, "right")).toBe("deleted");
+  });
+
+  it("ignores whitespace-only differences according to IgnorePolicy", () => {
+    const b = lines("  alpha", "beta", "gamma");
+    const l = lines("alpha", "beta", "gamma");
+    const r = lines("  alpha  ", "beta", "GAMMA");
+    expect(startMerge(l, b, r, "none").changes).toHaveLength(2);
+    const trimmed = startMerge(l, b, r, "trim").changes;
+    expect(trimmed).toHaveLength(1);
+    expect(trimmed[0]!.right).toBe("GAMMA\n");
+    const ws = startMerge(lines("a   b", "c"), lines("a b", "c"), lines("a\tb", "c"), "whitespace").changes;
+    expect(ws).toHaveLength(0);
+  });
+
+  it("applies agent resolutions and non-conflicting changes in one undoable batch", () => {
+    const m = merge(left, base, right);
+    const { spec, applied } = applyAgentResolutions(m.view.state, new Map([[0, "MERGED\n"]]), {
+      applyNonConflicting: true,
+    });
+    expect(applied).toBe(3);
+    m.run(spec);
+    expect(m.text).toBe(lines("a", "MERGED", "c", "D", "e", "f", "G"));
+    expect(m.changes.every(isResolved)).toBe(true);
+    expect(m.changes[0]!.agentResolved).toBe(true);
+    expect(m.changes[1]!.agentResolved).toBeFalsy();
+
+    expect(m.undo()).toBe(true);
+    expect(m.text).toBe(base);
+    expect(unresolved(m.view.state)).toHaveLength(3);
+    expect(m.changes[0]!.agentResolved).toBeFalsy();
+
+    m.run(applyAgentResolutions(m.view.state, new Map([[0, "MERGED\n"]])).spec);
+    m.run(revertResolved(m.view.state));
+    expect(m.text).toBe(base);
+    expect(m.changes[0]!.agentResolved).toBe(false);
   });
 });

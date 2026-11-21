@@ -10,7 +10,12 @@ import {
 } from "../mergeActions";
 
 let dispose: () => void;
-const host = (): MergeActionHost => ({ enabled: () => true, run: vi.fn(), autoApply: () => false });
+const host = (): MergeActionHost => ({
+  enabled: () => true,
+  run: vi.fn(),
+  autoApply: () => false,
+  syncScroll: () => true,
+});
 beforeEach(() => {
   setFocusedMergeEditor(null);
   dispose = registerMergeActions();
@@ -22,7 +27,7 @@ afterEach(() => {
 
 it("keeps merge commands registered and disabled outside a merge editor", async () => {
   const commands = allActions().filter((a) => a.id.startsWith("merge."));
-  expect(commands.length).toBe(30);
+  expect(commands.length).toBe(32);
   expect(commands.filter((a) => !a.hidden).every((a) => a.keywords?.includes("merge"))).toBe(true);
   expect(commands.every((a) => !isActionEnabled(a))).toBe(true);
   expect(await executeAction("merge.acceptYours")).toBe(false);
@@ -59,4 +64,13 @@ it("shares changing enablement and toggle state with action menus", async () => 
   expect(isActionEnabled(getAction("merge.resolveSimple")!)).toBe(false);
   expect(await executeAction("merge.resolveSimple")).toBe(false);
   expect(editor.run).not.toHaveBeenCalled();
+
+  enabled = true;
+  refreshMergeActions(editor);
+  const syncMenu = () => resolveMenuItems([{ kind: "action", action: "merge.syncScroll" }])[0]!;
+  expect(syncMenu().checked).toBe(true);
+  editor.syncScroll = () => false;
+  expect(syncMenu().checked).toBe(false);
+  await executeAction("merge.resolveWithAgent");
+  expect(editor.run).toHaveBeenCalledWith("resolveWithAgent", undefined);
 });

@@ -7,7 +7,7 @@
 import { StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { bandPath, extent } from "./diffScroll";
-import { changesSide, isConflict, mergeField, type MergeSide } from "./mergeModel";
+import { changesSide, mergeField, sideChangeType, type MergeSide } from "./mergeModel";
 
 const SVG = "http://www.w3.org/2000/svg";
 
@@ -35,13 +35,22 @@ export function mergeDividers(
   const listener = EditorView.updateListener.of(schedule);
   for (const v of panes) v.dispatch({ effects: StateEffect.appendConfig.of(listener) });
   for (const v of panes) v.scrollDOM.addEventListener("scroll", schedule, { passive: true });
+  const onWheel = (e: WheelEvent) => {
+    e.preventDefault();
+    views.result.scrollDOM.scrollBy(e.deltaX, e.deltaY);
+  };
+  dividers.left.addEventListener("wheel", onWheel, { passive: false });
+  dividers.right.addEventListener("wheel", onWheel, { passive: false });
   const resize = new ResizeObserver(schedule);
   resize.observe(dividers.left);
+  resize.observe(dividers.right);
   schedule();
   return () => {
     stopped = true;
     if (frame >= 0) cancelAnimationFrame(frame);
     for (const v of panes) v.scrollDOM.removeEventListener("scroll", schedule);
+    dividers.left.removeEventListener("wheel", onWheel);
+    dividers.right.removeEventListener("wheel", onWheel);
     resize.disconnect();
     layers.left.remove();
     layers.right.remove();
@@ -73,13 +82,16 @@ export function drawMergeDivider(
     const [s0, s1] = extent(sideView, from, to).map((y) => y + offSide) as [number, number];
     const [r0, r1] = extent(result, c.from, c.to).map((y) => y + offResult) as [number, number];
     if ((s1 < -1 && r1 < -1) || (s0 > h + 1 && r0 > h + 1)) continue;
-    const [a0, a1, b0, b1] = side === "left" ? [s0, s1, r0, r1] : [r0, r1, s0, s1];
-    const kind = isConflict(c) ? "conflict" : "change";
-    const midA = (a0 + a1) / 2;
-    const midB = (b0 + b1) / 2;
+    let [a0, a1, b0, b1] = side === "left" ? [s0, s1, r0, r1] : [r0, r1, s0, s1];
+    const kind = sideChangeType(c, side);
+    const fill = bandPath(w, a0, a1, b0, b1);
+    if (a1 - a0 < 2) [a0, a1] = [a0 - 1, a0 + 1];
+    if (b1 - b0 < 2) [b0, b1] = [b0 - 1, b0 + 1];
+    const c1 = w * 0.3;
+    const c2 = w * 0.7;
     paths +=
-      `<path class="cm-mergeBand cm-mergeBand-${kind}" d="${bandPath(w, a0, a1, b0, b1)}"/>` +
-      `<path class="cm-mergeBandLine cm-mergeBand-${kind}" d="M0 ${midA}C${w * 0.3} ${midA} ${w * 0.7} ${midB} ${w} ${midB}"/>`;
+      `<path class="cm-mergeBand cm-mergeBand-${kind}" d="${fill}"/>` +
+      `<path class="cm-mergeBandEdge cm-mergeBand-${kind}" d="M0 ${a0}C${c1} ${a0} ${c2} ${b0} ${w} ${b0}M0 ${a1}C${c1} ${a1} ${c2} ${b1} ${w} ${b1}"/>`;
   }
   svg.innerHTML = paths;
 }

@@ -17,6 +17,7 @@ export function showResultMenu(e: React.MouseEvent, view: EditorView) {
   selectUnderPointer(view, e);
   showContextMenu(e.nativeEvent, [
     { kind: "action", action: "merge.resolveAutomatically" },
+    { kind: "action", action: "merge.resolveWithAgent" },
     { kind: "action", action: "merge.ignore" },
     { kind: "separator" },
     { kind: "action", action: "merge.cut" },
@@ -57,5 +58,8 @@ export function showCompareMenu(at: MenuPosition) {
 }
 
 export function showSettingsMenu(at: MenuPosition) {
-  showContextMenu(at, [{ kind: "action", action: "merge.autoApply" }]);
+  showContextMenu(at, [
+    { kind: "action", action: "merge.syncScroll" },
+    { kind: "action", action: "merge.autoApply" },
+  ]);
 }

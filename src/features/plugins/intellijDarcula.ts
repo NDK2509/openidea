@@ -73,6 +73,7 @@ export const DARCULA_TOKENS: Readonly<Record<string, string>> = {
   "--syn-punct": "#a9b7c6",
   "--syn-string": "#6a8759",
   "--syn-escape": "#cc7832",
+  "--diff-conflict": "#45302b",
   "--diff-conflict-stripe": "#8f5247",
   "--diff-deleted": "#484a4a",
   "--diff-deleted-stripe": "#656e76",

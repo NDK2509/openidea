@@ -14,8 +14,10 @@ import {
   type TransactionSpec,
 } from "@codemirror/state";
 import { mergeChanges, type ChangeKind } from "./mergeDiff3";
+import type { IgnorePolicy } from "./diffOptions";
 
 export type MergeSide = "left" | "right";
+export type MergeChangeType = "conflict" | "inserted" | "deleted" | "modified";
 
 export interface MergeChange {
   /** Where the change sits in the result; follows the document as it is edited. */
@@ -34,6 +36,8 @@ export interface MergeChange {
   done: { readonly left: boolean; readonly right: boolean };
   /** One side of a conflict was accepted and the other is still to be decided. */
   oneside: boolean;
+  /** Settled by a coding agent resolution batch. */
+  agentResolved?: boolean;
 }
 
 export const isResolved = (c: MergeChange) => c.done.left && c.done.right;
@@ -45,6 +49,20 @@ export const changesSide = (c: MergeChange, side: MergeSide) =>
 const textOf = (c: MergeChange, side: MergeSide) => (side === "left" ? c.left : c.right);
 const opposite = (side: MergeSide): MergeSide => (side === "left" ? "right" : "left");
 const settled = (c: MergeChange): MergeChange => ({ ...c, done: { left: true, right: true } });
+
+/** A change's visual type (`MergeConflictType`): conflict, else inserted/deleted/modified against base. */
+export function changeType(c: MergeChange): MergeChangeType {
+  if (isConflict(c)) return "conflict";
+  const changed = c.kind === "right" ? c.right : c.left;
+  return c.base === "" ? "inserted" : changed === "" ? "deleted" : "modified";
+}
+
+/** A change's visual type on a specific side pane against the base. */
+export function sideChangeType(c: MergeChange, side: MergeSide): MergeChangeType {
+  if (isConflict(c)) return "conflict";
+  const text = textOf(c, side);
+  return c.base === "" ? "inserted" : text === "" ? "deleted" : "modified";
+}
 
 interface Placed {
   index: number;
@@ -59,10 +77,16 @@ const setChange = StateEffect.define<Placed>({
   }),
 });
 
+/** Replaces the full list of changes (e.g. when recomputing under a new whitespace policy). */
+export const resetChanges = StateEffect.define<readonly MergeChange[]>();
+
 /** The changes of the merge, in document order. Typing at the edge of a change stays inside it. */
 export const mergeField = StateField.define<readonly MergeChange[]>({
   create: () => [],
   update(value, tr) {
+    for (const e of tr.effects) {
+      if (e.is(resetChanges)) return e.value;
+    }
     let next = tr.docChanged
       ? value.map((c) => ({ ...c, from: tr.changes.mapPos(c.from, -1), to: tr.changes.mapPos(c.to, 1) }))
       : value;
@@ -87,12 +111,17 @@ export const mergeHistory = invertedEffects.of((tr) => {
 });
 
 /** The result's starting text, the base, and the changes waiting in it. */
-export function startMerge(left: string, base: string, right: string): { text: string; changes: MergeChange[] } {
+export function startMerge(
+  left: string,
+  base: string,
+  right: string,
+  ignore: IgnorePolicy = "none",
+): { text: string; changes: MergeChange[] } {
   // CodeMirror counts each line break as one UTF-16 code unit, including CRLF.
   left = left.replace(/\r\n?/g, "\n");
   base = base.replace(/\r\n?/g, "\n");
   right = right.replace(/\r\n?/g, "\n");
-  const found = mergeChanges(left, base, right);
+  const found = mergeChanges(left, base, right, ignore);
   // Too different to compare line by line: the whole file is one change.
   const whole = (): MergeChange[] => {
     if (left === base && right === base) return [];
@@ -307,10 +336,39 @@ export function revertResolved(state: EditorState): TransactionSpec | null {
     plans.push({
       index,
       edit: replace(c, c.base),
-      next: { ...c, oneside: false, done: { left: false, right: false } },
+      next: { ...c, oneside: false, agentResolved: false, done: { left: false, right: false } },
     });
   });
   return commit(state, plans, "input.resolve");
+}
+
+/**
+ * Applies agent-resolved texts atomically in one undoable transaction, optionally
+ * also applying remaining non-conflicting changes in the same step.
+ */
+export function applyAgentResolutions(
+  state: EditorState,
+  resolutions: ReadonlyMap<number, string>,
+  opts?: { applyNonConflicting?: boolean },
+): { spec: TransactionSpec | null; applied: number } {
+  const changes = state.field(mergeField);
+  const plans: Plan[] = [];
+  for (let i = 0; i < changes.length; i++) {
+    const c = changes[i]!;
+    if (isResolved(c)) continue;
+    if (resolutions.has(i)) {
+      plans.push({
+        index: i,
+        edit: replace(c, resolutions.get(i)!),
+        next: { ...settled(c), agentResolved: true },
+      });
+    } else if (opts?.applyNonConflicting && !isConflict(c) && canResolveAutomatically(state.doc, c, "base")) {
+      const p = resolveAutomatically(state.doc, c, i, "base");
+      if (p) plans.push(p);
+    }
+  }
+  const spec = commit(state, plans, "input.resolve.agent");
+  return { spec, applied: plans.length };
 }
 
 /** The changes still to be settled. */

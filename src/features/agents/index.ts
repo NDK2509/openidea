@@ -15,6 +15,7 @@ import { isVirtualUri } from "@/platform/virtualDocs";
 import { call, commands } from "@/platform/ipc";
 import {
   maybeEditorService,
+  mergeAgentTarget,
   registerAgentContextSource,
   registerEditorDropHandler,
   registerEditorKind,
@@ -413,6 +414,38 @@ export function activate(): () => void {
         run: async () => {
           const { generateCommitMessage } = await import("./commitMessage");
           await generateCommitMessage();
+        },
+      },
+      {
+        id: "agents.mergeConflicts",
+        title: "Merge Conflicts with Agent",
+        description: "Has the coding agent resolve unresolved merge conflicts in the active merge editor.",
+        category: "Agents",
+        icon: "toolwindow-agents",
+        keywords: ["agent", "merge", "conflict", "ai", "resolve"],
+        indicatesRunning: true,
+        enabled: ({ ctx, arg }) => {
+          if (arg && typeof arg === "object" && "key" in arg) {
+            return !!mergeAgentTarget((arg as { key?: string }).key);
+          }
+          return !!ctx.mergeEditorFocus && !!mergeAgentTarget();
+        },
+        run: async ({ arg }) => {
+          const { mergeConflictsWithAgent } = await import("./mergeConflicts");
+          await mergeConflictsWithAgent(
+            arg && typeof arg === "object" ? (arg as { key?: string; indexes?: number[] }) : undefined,
+          );
+        },
+      },
+      {
+        id: "agents.cancelMergeConflicts",
+        title: "Cancel Agent Merge",
+        category: "Agents",
+        hidden: true,
+        run: async ({ arg }) => {
+          const { cancelMergeConflicts } = await import("./mergeConflicts");
+          const key = arg && typeof arg === "object" && "key" in arg ? (arg as { key?: string }).key : undefined;
+          cancelMergeConflicts(key);
         },
       },
       {

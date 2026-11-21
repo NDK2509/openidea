@@ -35,10 +35,12 @@ function divider() {
 }
 
 const bands = (svg: SVGSVGElement) => [...svg.querySelectorAll(".cm-mergeBand")].map((p) => p.getAttribute("class"));
+const edges = (svg: SVGSVGElement) =>
+  [...svg.querySelectorAll(".cm-mergeBandEdge")].map((p) => p.getAttribute("class"));
 
 describe("merge dividers", () => {
   // #3876: a band joins each side change to where it lands in the result.
-  it("draws a band per open change of each side, and drops a side's band once it is accepted", () => {
+  it("draws a band and edge strokes per open change of each side, and drops a side's band once accepted", () => {
     const base = lines("a", "b", "c", "d", "e", "f", "g");
     const left = lines("a", "B", "c", "d", "e", "F1", "g");
     const right = lines("a", "b", "c", "D", "e", "F2", "g");
@@ -50,13 +52,30 @@ describe("merge dividers", () => {
     const r = divider();
     drawMergeDivider("left", ours, result, l.el, l.svg);
     drawMergeDivider("right", theirs, result, r.el, r.svg);
-    expect(bands(l.svg)).toEqual(["cm-mergeBand cm-mergeBand-change", "cm-mergeBand cm-mergeBand-conflict"]);
-    expect(bands(r.svg)).toEqual(["cm-mergeBand cm-mergeBand-change", "cm-mergeBand cm-mergeBand-conflict"]);
+    expect(bands(l.svg)).toEqual(["cm-mergeBand cm-mergeBand-modified", "cm-mergeBand cm-mergeBand-conflict"]);
+    expect(edges(l.svg)).toEqual(["cm-mergeBandEdge cm-mergeBand-modified", "cm-mergeBandEdge cm-mergeBand-conflict"]);
+    expect(bands(r.svg)).toEqual(["cm-mergeBand cm-mergeBand-modified", "cm-mergeBand cm-mergeBand-conflict"]);
 
     result.dispatch(applyTo(result.state, [0], { type: "accept", side: "left", resolve: true })!);
     drawMergeDivider("left", ours, result, l.el, l.svg);
     drawMergeDivider("right", theirs, result, r.el, r.svg);
     expect(bands(l.svg)).toEqual(["cm-mergeBand cm-mergeBand-conflict"]);
-    expect(bands(r.svg)).toEqual(["cm-mergeBand cm-mergeBand-change", "cm-mergeBand cm-mergeBand-conflict"]);
+    expect(bands(r.svg)).toEqual(["cm-mergeBand cm-mergeBand-modified", "cm-mergeBand cm-mergeBand-conflict"]);
+  });
+
+  it("classifies inserted and deleted one-sided changes distinctly", () => {
+    const base = lines("a", "x", "b", "c");
+    const left = lines("a", "added", "x", "b", "c");
+    const right = lines("a", "x", "c");
+    const start = startMerge(left, base, right);
+    const result = view(start.text, [mergeField.init(() => start.changes)]);
+    const ours = view(left);
+    const theirs = view(right);
+    const l = divider();
+    const r = divider();
+    drawMergeDivider("left", ours, result, l.el, l.svg);
+    drawMergeDivider("right", theirs, result, r.el, r.svg);
+    expect(bands(l.svg)).toEqual(["cm-mergeBand cm-mergeBand-inserted"]);
+    expect(bands(r.svg)).toEqual(["cm-mergeBand cm-mergeBand-deleted"]);
   });
 });

@@ -6,6 +6,7 @@
  */
 import { diff } from "@codemirror/merge";
 import { changesBetween, optimizeLineChunks, unchangedBetween } from "./chunkOptimizer";
+import type { IgnorePolicy } from "./diffOptions";
 
 /** A change between the base (A) and a side (B), in tokens. */
 interface Delta {
@@ -149,18 +150,31 @@ function classify(
   right: string,
   same: (a: string, b: string) => boolean,
 ): ChangeKind | null {
-  if (base === "") {
-    if (left === "") return "right";
-    if (right === "") return "left";
-    return same(left, right) ? "both" : "conflict";
-  }
-  if (left === "" && right === "") return "both";
   const unchangedLeft = same(base, left);
   const unchangedRight = same(base, right);
   if (unchangedLeft && unchangedRight) return null;
+  if (base === "") {
+    if (unchangedLeft) return "right";
+    if (unchangedRight) return "left";
+    return same(left, right) ? "both" : "conflict";
+  }
+  if (left === "" && right === "") return "both";
   if (unchangedLeft) return "right";
   if (unchangedRight) return "left";
   return same(left, right) ? "both" : "conflict";
+}
+
+function lineCompareKey(ignore: IgnorePolicy): (text: string) => string {
+  switch (ignore) {
+    case "trim":
+      return (s) => s.replace(/^[^\S\r\n]+|[^\S\r\n]+(?=\r?\n?$)/gm, "");
+    case "whitespace":
+      return (s) => s.replace(/[^\S\r\n]+/g, "");
+    case "whitespaceAndLines":
+      return (s) => s.replace(/\s+/g, "");
+    default:
+      return (s) => s;
+  }
 }
 
 /** Lines of `text`, each with its terminator, so joining them gives `text` back. */
@@ -185,10 +199,17 @@ export interface TextChange {
 }
 
 /** The changes between the versions line by line; `null` when the files are too different to compare. */
-export function mergeChanges(left: string, base: string, right: string): TextChange[] | null {
+export function mergeChanges(
+  left: string,
+  base: string,
+  right: string,
+  ignore: IgnorePolicy = "none",
+): TextChange[] | null {
   const lines = [splitLines(left), splitLines(base), splitLines(right)] as const;
-  const clusters = diff3(lines[0], lines[1], lines[2], undefined, 3000, true);
+  const key = lineCompareKey(ignore);
+  const clusters = diff3(lines[0], lines[1], lines[2], key, 3000, true);
   if (!clusters) return null;
+  const same = ignore === "none" ? (x: string, y: string) => x === y : (x: string, y: string) => key(x) === key(y);
   const offsets = (ls: readonly string[]) => {
     const out = [0];
     for (const line of ls) out.push(out[out.length - 1]! + line.length);
@@ -201,7 +222,7 @@ export function mergeChanges(left: string, base: string, right: string): TextCha
     const l = slice(left, 0, c.left);
     const b = slice(base, 1, c.base);
     const r = slice(right, 2, c.right);
-    const kind = classify(l, b, r, (x, y) => x === y);
+    const kind = classify(l, b, r, same);
     if (!kind) continue;
     out.push({
       baseFrom: at[1][c.base[0]]!,

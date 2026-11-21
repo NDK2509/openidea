@@ -16,6 +16,7 @@ const COMMANDS = [
   ["compare", "Compare Contents", "diff"],
   ["settings", "Merge Settings", "settings"],
   ["autoApply", "Automatically Apply Non-Conflicting Changes"],
+  ["syncScroll", "Synchronize Scrolling", "lock"],
   ["compareYoursResult", "Yours and Result"],
   ["compareResultTheirs", "Result and Theirs"],
   ["compareYoursTheirs", "Yours and Theirs"],
@@ -27,6 +28,7 @@ const COMMANDS = [
   ["resolveUsingTheirs", "Resolve Using Theirs"],
   ["ignore", "Ignore", "diff-remove"],
   ["resolveAutomatically", "Resolve Automatically", "diff-magic"],
+  ["resolveWithAgent", "Resolve with Agent", "toolwindow-agents"],
   ["annotate", "Annotate with Git Blame", "changelist"],
   ["cut", "Cut"],
   ["copy", "Copy", "copy"],
@@ -41,6 +43,7 @@ export interface MergeActionHost {
   enabled(command: MergeCommand): boolean;
   run(command: MergeCommand, arg?: unknown): void | Promise<void>;
   autoApply(): boolean;
+  syncScroll?(): boolean;
 }
 
 let focused: MergeActionHost | null = null;
@@ -69,7 +72,12 @@ export function registerMergeActions(): () => void {
       when: `mergeEditorFocus && merge.${command}`,
       keywords: ["merge", "conflict"],
       hidden: command === "change",
-      toggled: command === "autoApply" ? () => focused?.autoApply() ?? false : undefined,
+      toggled:
+        command === "autoApply"
+          ? () => focused?.autoApply() ?? false
+          : command === "syncScroll"
+            ? () => focused?.syncScroll?.() ?? true
+            : undefined,
       run: ({ arg }) => focused?.run(command, arg),
     })),
   );

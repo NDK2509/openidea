@@ -141,7 +141,10 @@ export const ICLS_ATTRIBUTES: Record<string, Array<[Part, string]>> = {
     ["BACKGROUND", "--diff-deleted"],
     ["ERROR_STRIPE_COLOR", "--diff-deleted-stripe"],
   ],
-  DIFF_CONFLICT: [["ERROR_STRIPE_COLOR", "--diff-conflict-stripe"]],
+  DIFF_CONFLICT: [
+    ["BACKGROUND", "--diff-conflict"],
+    ["ERROR_STRIPE_COLOR", "--diff-conflict-stripe"],
+  ],
   DEFAULT_KEYWORD: [["FOREGROUND", "--syn-keyword"]],
   DEFAULT_STRING: [["FOREGROUND", "--syn-string"]],
   DEFAULT_NUMBER: [["FOREGROUND", "--syn-number"]],

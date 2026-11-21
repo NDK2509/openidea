@@ -5,8 +5,14 @@ export const MERGE_KIND = "merge";
 
 export interface MergeData {
   path: string;
+  autoAgent?: boolean;
 }
 
-export function mergeInput(path: string): EditorInput {
-  return { kind: MERGE_KIND, key: `merge:${path}`, path, data: { path } satisfies MergeData };
+export function mergeInput(path: string, opts?: { autoAgent?: boolean }): EditorInput {
+  return {
+    kind: MERGE_KIND,
+    key: `merge:${path}`,
+    path,
+    data: { path, ...(opts?.autoAgent ? { autoAgent: true } : {}) } satisfies MergeData,
+  };
 }

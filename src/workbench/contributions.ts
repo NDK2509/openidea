@@ -1073,6 +1073,75 @@ let commitServiceImpl: CommitService | undefined;
 export const provideCommitService = (s: CommitService | undefined) => void (commitServiceImpl = s);
 export const maybeCommitService = (): CommitService | undefined => commitServiceImpl;
 
+/** One unresolved hunk sent to the coding agent for 3-way conflict resolution. */
+export interface MergeAgentHunk {
+  index: number;
+  kind: "left" | "right" | "both" | "conflict";
+  base: string;
+  left: string;
+  right: string;
+  current: string;
+  startLine: number;
+  endLine: number;
+  contextBefore: string;
+  contextAfter: string;
+}
+
+export interface MergeAgentSnapshot {
+  revision: number;
+  path: string;
+  leftLabel: string;
+  rightLabel: string;
+  resultText: string;
+  hunks: MergeAgentHunk[];
+}
+
+export interface MergeAgentProgress {
+  state: "idle" | "running" | "done" | "error";
+  providerName?: string;
+  hunkCount?: number;
+  summary?: string;
+  error?: string;
+}
+
+/** Merge editor host registered by the VCS feature so coding agents can resolve conflicts without cross-feature imports. */
+export interface MergeAgentTarget {
+  readonly key: string;
+  snapshot(indexes?: readonly number[]): MergeAgentSnapshot | null;
+  applyResolutions(
+    revision: number,
+    resolutions: ReadonlyMap<number, string>,
+    opts?: { applyNonConflicting?: boolean },
+  ): number;
+  setProgress(progress: MergeAgentProgress): void;
+  undo(): void;
+}
+
+const mergeAgentTargets = new Map<string, MergeAgentTarget>();
+let activeMergeAgentKey: string | null = null;
+
+export function registerMergeAgentTarget(target: MergeAgentTarget): () => void {
+  mergeAgentTargets.set(target.key, target);
+  if (activeMergeAgentKey === null) activeMergeAgentKey = target.key;
+  return () => {
+    if (mergeAgentTargets.get(target.key) === target) {
+      mergeAgentTargets.delete(target.key);
+      if (activeMergeAgentKey === target.key) {
+        activeMergeAgentKey = mergeAgentTargets.keys().next().value ?? null;
+      }
+    }
+  };
+}
+
+export function setActiveMergeAgentTarget(key: string | null): void {
+  if (key === null || mergeAgentTargets.has(key)) activeMergeAgentKey = key;
+}
+
+export function mergeAgentTarget(key?: string | null): MergeAgentTarget | undefined {
+  if (key) return mergeAgentTargets.get(key);
+  return activeMergeAgentKey ? mergeAgentTargets.get(activeMergeAgentKey) : undefined;
+}
+
 /**
  * Context a feature offers the agent composer's `@` menu (`@problems`, `@terminal`): what
  * choosing it inserts, a ``` block (`info` names its kind: `problems`, `terminal <title>`)

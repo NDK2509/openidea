@@ -1,34 +1,43 @@
 /** Three-pane merge editor: Yours | Result | Theirs, after IntelliJ's merge tool. */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { Transaction, type EditorState, type Extension, type TransactionSpec } from "@codemirror/state";
+import clsx from "clsx";
+import { Compartment, Transaction, type EditorState, type Extension, type TransactionSpec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
-import { history, historyKeymap, undoDepth } from "@codemirror/commands";
-import { unifiedMergeView } from "@codemirror/merge";
+import { history, historyKeymap, undo, undoDepth } from "@codemirror/commands";
 import type { MergeSides } from "@/bindings";
 import { embeddedEditorExtensions } from "@/editor/api";
 import { executeAction } from "@/platform/actions";
 import { setContext } from "@/platform/context";
 import { tx, useTxTemplate } from "@/platform/i18n";
 import { call, commands } from "@/platform/ipc";
+import { readClipboardPlainText } from "@/platform/clipboard";
 import { copyText } from "@/ui/selectableText";
-import { Button, Spinner, SplitGroup, SplitHandle, SplitPanel, T } from "@/ui";
-import { editorService, type EditorInput } from "@/workbench/contributions";
+import { Button, Icon, IconButton, Spinner, SplitGroup, SplitHandle, SplitPanel, T } from "@/ui";
+import {
+  editorService,
+  registerMergeAgentTarget,
+  setActiveMergeAgentTarget,
+  type EditorInput,
+  type MergeAgentHunk,
+  type MergeAgentProgress,
+  type MergeAgentSnapshot,
+} from "@/workbench/contributions";
 import { blameSlot, toggleAnnotations } from "./blame";
 import { firstLineOf, languageFor, viewerBase } from "./cm";
-import { ideaDiffConfig } from "./diffOptions";
+import type { HighlightPolicy, IgnorePolicy } from "./diffOptions";
 import { confirmDialog } from "./dialogs";
 import { focusedDiffNavigator, setFocusedDiffNavigator, type DiffNavigator } from "./diffNavigator";
 import { mergeDividers } from "./mergeDividers";
 import { syncMergeScroll } from "./mergeScroll";
 import { mergeTitles } from "./conflicts";
-import { acceptConflictSide } from "./conflictsUi";
 import {
+  createResultMarks,
   mergeChanged,
   mergeStripe,
   mergeTheme,
   resultControls,
-  resultMarks,
   sideControls,
+  sideMarks,
   syncSide,
   type MergeControls,
 } from "./mergeGutters";
@@ -42,15 +51,19 @@ import {
   type MergeCommand,
 } from "./mergeActions";
 import {
+  applyAgentResolutions,
   applyNonConflicting,
   applyTo,
   canApply,
   changesIn,
   changesInSide,
-  resolveSimple,
-  revertResolved,
+  isConflict,
+  isResolved,
   mergeField,
   mergeHistory,
+  resetChanges,
+  resolveSimple,
+  revertResolved,
   startMerge,
   summarize,
   unresolved,
@@ -65,10 +78,8 @@ import { refreshNow } from "./store";
 import styles from "./MergeEditor.module.css";
 
 import type { MergeData } from "./mergeKind";
-import { readClipboardPlainText } from "@/platform/clipboard";
 export { MERGE_KIND, mergeInput, type MergeData } from "./mergeKind";
 
-/** Until the result is built: nothing to step through, and no "all processed" notice yet. */
 const NOTHING_LEFT: MergeSummary = {
   pending: 0,
   conflicts: 0,
@@ -96,27 +107,41 @@ const writeAutoApply = (on: boolean) => {
   }
 };
 
-// Each side against the base is compared line by line, as in the diff viewer. The default diff
-// gives up on long files and marks the whole file as one changed block.
-const SIDE_DIFF = ideaDiffConfig("none", "words");
 /** A file without a language; one value, so finding none again doesn't rebuild the panes. */
 const NO_LANGUAGE: Extension = [];
+const CONTEXT_LINES = 25;
+
+/** Highlights the branch/commit suffix of IntelliJ-style labels like `Changes from master`. */
+function renderBranchLabel(text: string) {
+  const m = /^(Changes from |Rebasing .+? from )(.+)$/.exec(text);
+  if (!m) return text;
+  return (
+    <>
+      {m[1]}
+      <strong>{m[2]}</strong>
+    </>
+  );
+}
 
 export function MergeEditor({ input }: { input: EditorInput }) {
-  const { path } = input.data as MergeData;
+  const data = input.data as MergeData;
+  const { path } = data;
   const [state, setState] = useState<{
     ours: string;
     theirs: string;
     base: string | null;
     sides: MergeSides;
+    deleted: Record<MergeSide, boolean>;
   } | null>(null);
-  const [binary, setBinary] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lang, setLang] = useState<Extension | null>(null);
   const [summary, setSummary] = useState<MergeSummary>(NOTHING_LEFT);
   const [autoApply, setAutoApply] = useState(readAutoApply);
+  const [ignore, setIgnore] = useState<IgnorePolicy>("none");
+  const [highlight, setHighlight] = useState<HighlightPolicy>("words");
+  const [syncScroll, setSyncScroll] = useState(true);
+  const [agentProgress, setAgentProgress] = useState<MergeAgentProgress>({ state: "idle" });
   const [resolved, setResolved] = useState(false);
-  const accepting = useRef(false);
   const paneId = useId();
   const rootRef = useRef<HTMLDivElement>(null);
   const paneRef = useRef<MergeSide | "result">("result");
@@ -124,6 +149,7 @@ export function MergeEditor({ input }: { input: EditorInput }) {
     enabled: () => false,
     run: () => {},
     autoApply: () => false,
+    syncScroll: () => true,
   }));
   const oursRef = useRef<HTMLDivElement>(null);
   const resultRef = useRef<HTMLDivElement>(null);
@@ -133,31 +159,52 @@ export function MergeEditor({ input }: { input: EditorInput }) {
   const resultView = useRef<EditorView | null>(null);
   const oursView = useRef<EditorView | null>(null);
   const theirsView = useRef<EditorView | null>(null);
+  const slotsRef = useRef<{ ours: Compartment; theirs: Compartment; result: Compartment } | null>(null);
+  const scrollStopRef = useRef<(() => void) | null>(null);
+  const revisionRef = useRef(0);
   const autoApplyRef = useRef(autoApply);
+  const ignoreRef = useRef(ignore);
+  const lastAppliedIgnoreRef = useRef(ignore);
+  const highlightRef = useRef(highlight);
+  const syncScrollRef = useRef(syncScroll);
+  const autoAgentTriggeredRef = useRef(false);
   useEffect(() => {
     autoApplyRef.current = autoApply;
   }, [autoApply]);
+  useEffect(() => {
+    ignoreRef.current = ignore;
+  }, [ignore]);
+  useEffect(() => {
+    highlightRef.current = highlight;
+  }, [highlight]);
+  useEffect(() => {
+    syncScrollRef.current = syncScroll;
+  }, [syncScroll]);
   const txt = useTxTemplate();
   const titles = mergeTitles(state?.sides);
+  const yourTitle = txt(titles.yours);
+  const resultTitle = tx("Result");
+  const theirTitle = txt(titles.theirs);
+  const titlesRef = useRef({ yourTitle, theirTitle });
+  useEffect(() => {
+    titlesRef.current = { yourTitle, theirTitle };
+  }, [yourTitle, theirTitle]);
 
   const load = useCallback(async () => {
     try {
       const v = await call(commands.vcsConflictVersions(path));
-      const binaryContent = !!v.binary || [v.base, v.ours, v.theirs].some((text) => text?.includes("\0"));
-      setBinary(binaryContent);
-      setError(null);
-      if (binaryContent) {
-        setState(null);
-        return;
+      if ([v.base, v.ours, v.theirs].some((text) => text?.includes("\0"))) {
+        throw new Error(tx("Binary files cannot be resolved in the merge editor."));
       }
       setState({
         ours: v.ours ?? "",
         theirs: v.theirs ?? "",
         base: v.base,
         sides: v.sides,
+        deleted: { left: v.ours === null, right: v.theirs === null },
       });
+      setError(null);
     } catch (e) {
-      setBinary(false);
       setError(errorMessage(e));
     }
   }, [path]);
@@ -165,6 +212,77 @@ export function MergeEditor({ input }: { input: EditorInput }) {
   useEffect(() => {
     void Promise.resolve().then(load);
   }, [load]);
+
+  useEffect(() => {
+    const buildSnapshot = (indexes?: readonly number[]): MergeAgentSnapshot | null => {
+      const v = resultView.current;
+      if (!v) return null;
+      const doc = v.state.doc;
+      const changes = v.state.field(mergeField);
+      const targetIndexes = indexes
+        ? indexes.filter((i) => changes[i] && !isResolved(changes[i]!))
+        : changes.flatMap((c, i) => (isConflict(c) && !isResolved(c) ? [i] : []));
+      const hunks: MergeAgentHunk[] = targetIndexes.map((index) => {
+        const c = changes[index]!;
+        const startLineObj = doc.lineAt(Math.min(c.from, doc.length));
+        const endPos = c.to > c.from ? Math.max(c.from, c.to - 1) : c.from;
+        const endLineObj = doc.lineAt(Math.min(endPos, doc.length));
+        const ctxBeforeStart = Math.max(1, startLineObj.number - CONTEXT_LINES);
+        const ctxAfterEnd = Math.min(doc.lines, endLineObj.number + CONTEXT_LINES);
+        const contextBefore =
+          startLineObj.number > 1 ? doc.sliceString(doc.line(ctxBeforeStart).from, startLineObj.from) : "";
+        const contextAfter =
+          endLineObj.number < doc.lines
+            ? doc.sliceString(doc.line(endLineObj.number + 1).from, doc.line(ctxAfterEnd).to)
+            : "";
+        return {
+          index,
+          kind: c.kind,
+          base: c.base,
+          left: c.left,
+          right: c.right,
+          current: doc.sliceString(c.from, c.to),
+          startLine: startLineObj.number,
+          endLine: endLineObj.number,
+          contextBefore,
+          contextAfter,
+        };
+      });
+      return {
+        revision: revisionRef.current,
+        path,
+        leftLabel: titlesRef.current.yourTitle,
+        rightLabel: titlesRef.current.theirTitle,
+        resultText: doc.toString(),
+        hunks,
+      };
+    };
+
+    const dispose = registerMergeAgentTarget({
+      key: input.key,
+      snapshot: buildSnapshot,
+      applyResolutions(revision, resolutions, opts) {
+        const v = resultView.current;
+        if (!v || revision !== revisionRef.current) return 0;
+        const { spec, applied } = applyAgentResolutions(v.state, resolutions, opts);
+        if (!spec || applied === 0) return 0;
+        v.dispatch(spec);
+        return applied;
+      },
+      setProgress: setAgentProgress,
+      undo: () => {
+        const v = resultView.current;
+        if (!v) return;
+        undo(v);
+        v.focus();
+      },
+    });
+    return () => {
+      void executeAction("agents.cancelMergeConflicts", { key: input.key });
+      dispose();
+    };
+  }, [input.key, path]);
+
   // From a side's first line (hashbang-only scripts): the file on disk may start with a conflict marker.
   const firstLine = state ? firstLineOf(state.ours || state.theirs) : undefined;
   useEffect(() => {
@@ -179,32 +297,60 @@ export function MergeEditor({ input }: { input: EditorInput }) {
   useEffect(() => {
     if (!state || lang === null || !oursRef.current || !resultRef.current || !theirsRef.current) return;
     // Like IntelliJ, the result starts as the base, with every change waiting to be decided.
-    const start = startMerge(state.ours, state.base ?? "", state.theirs);
+    const start = startMerge(state.ours, state.base ?? "", state.theirs, ignoreRef.current);
+    lastAppliedIgnoreRef.current = ignoreRef.current;
+    revisionRef.current = 0;
+    const slots = {
+      ours: new Compartment(),
+      theirs: new Compartment(),
+      result: new Compartment(),
+    };
+    slotsRef.current = slots;
+
     const change = (index: number, action: MergeAction) => {
       setFocusedMergeEditor(actionHost);
+      setActiveMergeAgentTarget(input.key);
       void executeAction("merge.change", { indexes: [index], action });
     };
     const controls: MergeControls = {
       accept: (index, side, resolve) => change(index, { type: "accept", side, resolve }),
       ignore: (index, side, resolve) => change(index, { type: "ignore", side: resolve ? null : side }),
       resolveAutomatically: (index) => change(index, { type: "auto", side: "base" }),
+      resolveWithAgent: (index) => {
+        setFocusedMergeEditor(actionHost);
+        setActiveMergeAgentTarget(input.key);
+        void executeAction("agents.mergeConflicts", { key: input.key, indexes: [index] });
+      },
     };
-    const side = (which: MergeSide): Extension[] => [
-      viewerBase({ readOnly: true }),
+    const sideBase = (which: MergeSide): Extension[] => [
       lang,
       blameSlot(),
       EditorView.updateListener.of((u) => {
         if (u.selectionSet) refreshMergeActions(actionHost);
       }),
-      state.base !== null
-        ? unifiedMergeView({ original: state.base, mergeControls: false, gutter: true, diffConfig: SIDE_DIFF })
-        : [],
-      sideControls(which, controls),
+      slots[which === "left" ? "ours" : "theirs"].of(sideMarks(which, highlightRef.current, ignoreRef.current)),
       mergeStripe(which),
       mergeTheme,
     ];
-    const ours = new EditorView({ doc: state.ours, parent: oursRef.current, extensions: side("left") });
-    const theirs = new EditorView({ doc: state.theirs, parent: theirsRef.current, extensions: side("right") });
+    // Left gutter faces Result on the right edge ([code][× >>][line#]); Right faces Result on the left ([line#][<< ×][code]).
+    const ours = new EditorView({
+      doc: state.ours,
+      parent: oursRef.current,
+      extensions: [
+        sideControls("left", controls),
+        viewerBase({ readOnly: true, lineNumbers: "after" }),
+        ...sideBase("left"),
+      ],
+    });
+    const theirs = new EditorView({
+      doc: state.theirs,
+      parent: theirsRef.current,
+      extensions: [
+        viewerBase({ readOnly: true, lineNumbers: true }),
+        sideControls("right", controls),
+        ...sideBase("right"),
+      ],
+    });
     const result: EditorView = new EditorView({
       doc: start.text,
       parent: resultRef.current,
@@ -216,11 +362,12 @@ export function MergeEditor({ input }: { input: EditorInput }) {
         mergeHistory,
         embeddedEditorExtensions(path),
         lang,
-        resultMarks,
+        slots.result.of(createResultMarks(highlightRef.current)),
         mergeStripe("result"),
         resultControls(controls),
         mergeTheme,
         EditorView.updateListener.of((u) => {
+          if (u.docChanged || mergeChanged(u)) revisionRef.current += 1;
           if (u.selectionSet || mergeChanged(u)) refreshMergeActions(actionHost);
           if (!mergeChanged(u)) return;
           const changes = u.state.field(mergeField);
@@ -241,22 +388,73 @@ export function MergeEditor({ input }: { input: EditorInput }) {
       // The starting point, not a step to undo.
       if (spec) result.dispatch({ ...spec, annotations: Transaction.addToHistory.of(false) });
     }
-    // Scroll the three panes together, lined up through their changes.
-    const stopSync = syncMergeScroll({ ours, result, theirs });
+    if (syncScrollRef.current) {
+      scrollStopRef.current = syncMergeScroll({ ours, result, theirs });
+    }
     const left = leftDividerRef.current;
     const right = rightDividerRef.current;
     const stopDividers = left && right ? mergeDividers({ ours, result, theirs }, { left, right }) : () => {};
+
+    if (data.autoAgent && !autoAgentTriggeredRef.current) {
+      autoAgentTriggeredRef.current = true;
+      queueMicrotask(() => {
+        void executeAction("agents.mergeConflicts", { key: input.key });
+      });
+    }
+
     return () => {
-      stopSync();
+      scrollStopRef.current?.();
+      scrollStopRef.current = null;
       stopDividers();
       ours.destroy();
       theirs.destroy();
       result.destroy();
+      slotsRef.current = null;
       resultView.current = null;
       oursView.current = null;
       theirsView.current = null;
     };
-  }, [state, lang, path, actionHost]);
+  }, [state, lang, path, actionHost, input.key, data.autoAgent]);
+
+  useEffect(() => {
+    const result = resultView.current;
+    const ours = oursView.current;
+    const theirs = theirsView.current;
+    const slots = slotsRef.current;
+    if (!result || !ours || !theirs || !slots) return;
+
+    if (ignore !== lastAppliedIgnoreRef.current && state) {
+      lastAppliedIgnoreRef.current = ignore;
+      if (undoDepth(result.state) === 0) {
+        const fresh = startMerge(state.ours, state.base ?? "", state.theirs, ignore);
+        result.dispatch({
+          changes: { from: 0, to: result.state.doc.length, insert: fresh.text },
+          effects: resetChanges.of(fresh.changes),
+          annotations: Transaction.addToHistory.of(false),
+        });
+        if (autoApplyRef.current) {
+          const spec = applyNonConflicting(result.state, "base");
+          if (spec) result.dispatch({ ...spec, annotations: Transaction.addToHistory.of(false) });
+        }
+      }
+    }
+
+    ours.dispatch({ effects: slots.ours.reconfigure(sideMarks("left", highlight, ignore)) });
+    theirs.dispatch({ effects: slots.theirs.reconfigure(sideMarks("right", highlight, ignore)) });
+    result.dispatch({ effects: slots.result.reconfigure(createResultMarks(highlight)) });
+  }, [highlight, ignore, state]);
+
+  useEffect(() => {
+    scrollStopRef.current?.();
+    scrollStopRef.current = null;
+    if (syncScroll && oursView.current && resultView.current && theirsView.current) {
+      scrollStopRef.current = syncMergeScroll({
+        ours: oursView.current,
+        result: resultView.current,
+        theirs: theirsView.current,
+      });
+    }
+  }, [syncScroll]);
 
   /**
    * Puts the caret at a change, brings it into view and focuses the pane: CodeMirror draws the
@@ -290,24 +488,23 @@ export function MergeEditor({ input }: { input: EditorInput }) {
     if (first) moveTo(v, first.from);
   };
 
-  const closeResolved = async () => {
-    setResolved(true);
-    await refreshNow();
-    await editorService().closeInput?.(input.key);
-  };
-
-  /** Saves the edited merge result as text and stages it. */
-  const writeResolved = async (text: string) => {
+  /** Saves `text` as the resolved file and stages it; like IDEA, that closes the merge editor. */
+  const writeResolved = async (text: string | null) => {
     const ok = await runOp(
       tx`Resolve ${baseName(path)}`,
       async () => {
-        await writeFileText(path, text, { save: true, exact: true });
+        if (text === null) await call(commands.fsDelete(path));
+        else await writeFileText(path, text, { save: true, exact: true });
         await call(commands.vcsStage([path]));
         return true;
       },
       { success: tx`${baseName(path)}: conflicts resolved` },
     );
-    if (ok) await closeResolved();
+    if (ok) {
+      setResolved(true);
+      await refreshNow();
+      await editorService().closeInput?.(input.key);
+    }
   };
 
   const apply = async () => {
@@ -338,23 +535,18 @@ export function MergeEditor({ input }: { input: EditorInput }) {
 
   /** Accept Yours / Accept Theirs: that version as it is, whatever was done in the result. */
   const acceptSide = async (side: MergeSide) => {
-    if ((!state && !binary) || accepting.current) return;
-    accepting.current = true;
-    try {
-      if (
-        modified() &&
-        !(await confirmDialog({
-          title: side === "left" ? "Accept Yours" : "Accept Theirs",
-          message: "The result was changed. Discard the changes and take this version as it is?",
-          okLabel: "Discard Changes",
-          danger: true,
-        }))
-      )
-        return;
-      if (await acceptConflictSide([path], side === "left" ? "ours" : "theirs")) await closeResolved();
-    } finally {
-      accepting.current = false;
-    }
+    if (!state) return;
+    if (
+      modified() &&
+      !(await confirmDialog({
+        title: side === "left" ? "Accept Yours" : "Accept Theirs",
+        message: "The result was changed. Discard the changes and take this version as it is?",
+        okLabel: "Discard Changes",
+        danger: true,
+      }))
+    )
+      return;
+    await writeResolved(state.deleted[side] ? null : side === "left" ? state.ours : state.theirs);
   };
 
   const cancel = async () => {
@@ -417,6 +609,7 @@ export function MergeEditor({ input }: { input: EditorInput }) {
       side === "result"
         ? changesIn(result.state, from, to)
         : changesInSide(result.state, side, view.state.doc, from, to);
+    if (id === "resolveWithAgent") return { indexes, action: null };
     let action: MergeAction;
     if (id === "resolveAutomatically") action = { type: "auto", side: "base" };
     else if (id === "ignore") action = { type: "ignore", side: side === "result" ? null : side };
@@ -429,7 +622,6 @@ export function MergeEditor({ input }: { input: EditorInput }) {
 
   const enabled = (id: MergeCommand) => {
     if (id === "reload" || id === "cancel") return !resolved;
-    if (binary && !resolved) return id === "acceptYours" || id === "acceptTheirs";
     const v = resultView.current;
     if (!v || error || resolved) return false;
     const available = summarize(v.state);
@@ -444,13 +636,21 @@ export function MergeEditor({ input }: { input: EditorInput }) {
         return available.simple;
       case "revert":
         return available.revert;
+      case "resolveWithAgent": {
+        if (paneRef.current !== "result") return false;
+        const decision = selectionDecision(id);
+        return !!decision?.indexes.some((i) => !isResolved(v.state.field(mergeField)[i]!));
+      }
       case "accept":
       case "resolveUsingYours":
       case "resolveUsingTheirs":
       case "ignore":
       case "resolveAutomatically": {
         const decision = selectionDecision(id);
-        return !!decision?.indexes.some((i) => canApply(v.state.doc, v.state.field(mergeField)[i]!, decision.action));
+        return (
+          !!decision?.action &&
+          !!decision.indexes.some((i) => canApply(v.state.doc, v.state.field(mergeField)[i]!, decision.action!))
+        );
       }
       case "annotate":
         return paneRef.current !== "result";
@@ -499,13 +699,22 @@ export function MergeEditor({ input }: { input: EditorInput }) {
         return showSettingsMenu(menuPosition("settings"));
       case "autoApply":
         return setAutoApplyNonConflicting(!autoApply);
+      case "syncScroll":
+        return setSyncScroll((on) => !on);
+      case "resolveWithAgent": {
+        const v = resultView.current;
+        if (!v) return;
+        const indexes = selectionDecision(id)?.indexes.filter((i) => !isResolved(v.state.field(mergeField)[i]!));
+        if (indexes?.length) await executeAction("agents.mergeConflicts", { key: input.key, indexes });
+        return;
+      }
       case "accept":
       case "resolveUsingYours":
       case "resolveUsingTheirs":
       case "ignore":
       case "resolveAutomatically": {
         const decision = selectionDecision(id);
-        if (decision) command((s) => applyTo(s, decision.indexes, decision.action));
+        if (decision?.action) command((s) => applyTo(s, decision.indexes, decision.action!));
         return;
       }
       case "change": {
@@ -559,7 +768,7 @@ export function MergeEditor({ input }: { input: EditorInput }) {
   };
 
   useEffect(() => {
-    Object.assign(actionHost, { enabled, run: runAction, autoApply: () => autoApply });
+    Object.assign(actionHost, { enabled, run: runAction, autoApply: () => autoApply, syncScroll: () => syncScroll });
     refreshMergeActions(actionHost);
   });
 
@@ -588,6 +797,7 @@ export function MergeEditor({ input }: { input: EditorInput }) {
       else if (theirsRef.current?.contains(target)) paneRef.current = "right";
       else if (resultRef.current?.contains(target)) paneRef.current = "result";
       setFocusedMergeEditor(actionHost);
+      setActiveMergeAgentTarget(input.key);
       setFocusedDiffNavigator(nav);
       setContext("diffEditorFocus", true);
     },
@@ -620,38 +830,96 @@ export function MergeEditor({ input }: { input: EditorInput }) {
         </Button>
       </div>
     );
-  if (binary)
-    return (
-      <div ref={rootRef} className={styles.message} {...focusProps}>
-        <T>Binary file. Choose which version to keep.</T>
-        <div className={styles.binaryActions}>
-          <Button onClick={() => void runAction("acceptYours")}>
-            <T>Accept Yours</T>
-          </Button>
-          <Button onClick={() => void runAction("acceptTheirs")}>
-            <T>Accept Theirs</T>
-          </Button>
-          <Button onClick={() => void runAction("cancel")}>
-            <T>Cancel</T>
-          </Button>
-        </div>
-      </div>
-    );
 
-  const yourTitle = txt(titles.yours);
-  const resultTitle = tx("Result");
-  const theirTitle = txt(titles.theirs);
+  const agentName = agentProgress.providerName ?? tx("agent");
+  const bannerMessage =
+    agentProgress.state === "running"
+      ? agentProgress.hunkCount === 1
+        ? tx`Merging 1 conflict with ${agentName}…`
+        : tx`Merging ${agentProgress.hunkCount ?? 0} conflicts with ${agentName}…`
+      : agentProgress.state === "done"
+        ? agentProgress.summary
+          ? agentProgress.summary
+          : agentProgress.hunkCount === 1
+            ? tx`Agent resolved 1 change.`
+            : tx`Agent resolved ${agentProgress.hunkCount ?? 0} changes.`
+        : agentProgress.state === "error"
+          ? (agentProgress.error ?? tx("Agent merge failed."))
+          : "";
+
   return (
-    <div ref={rootRef} className={styles.root} {...focusProps}>
-      <MergeToolbar summary={summary} step={goto} run={(c) => void runAction(c)} />
-      {state && lang !== null && summary !== NOTHING_LEFT && !summary.pending && (
-        <div className={styles.processed} role="status">
-          <span className={styles.processedText}>
-            <T>All changes have been processed.</T>
+    <div ref={rootRef} className={clsx(styles.root, highlight === "none" && styles.noHighlight)} {...focusProps}>
+      <MergeToolbar
+        summary={summary}
+        ignore={ignore}
+        onIgnoreChange={setIgnore}
+        highlight={highlight}
+        onHighlightChange={setHighlight}
+        syncScroll={syncScroll}
+        onSyncScrollChange={setSyncScroll}
+        agentRunning={agentProgress.state === "running"}
+        onMergeByAgent={() => void executeAction("agents.mergeConflicts", { key: input.key })}
+        onCancelAgent={() => void executeAction("agents.cancelMergeConflicts", { key: input.key })}
+        step={goto}
+        run={(c) => void runAction(c)}
+      />
+      {agentProgress.state !== "idle" && (
+        <div
+          className={clsx(
+            styles.agentBanner,
+            agentProgress.state === "running" && styles.agentBannerRunning,
+            agentProgress.state === "done" && styles.agentBannerDone,
+            agentProgress.state === "error" && styles.agentBannerError,
+          )}
+          role="status"
+        >
+          {agentProgress.state === "running" ? (
+            <Spinner size={13} />
+          ) : (
+            <Icon name={agentProgress.state === "done" ? "check" : "error"} size={14} />
+          )}
+          <span className={styles.agentBannerText} title={bannerMessage}>
+            {bannerMessage}
           </span>
-          <button type="button" className={styles.processedLink} onClick={() => void runAction("apply")}>
-            <T>Save changes and finish merging</T>
-          </button>
+          <div className={styles.agentBannerActions}>
+            {agentProgress.state === "running" && (
+              <Button
+                size="small"
+                onClick={() => void executeAction("agents.cancelMergeConflicts", { key: input.key })}
+              >
+                <T>Cancel</T>
+              </Button>
+            )}
+            {agentProgress.state === "done" && (
+              <Button
+                size="small"
+                icon="undo"
+                onClick={() => {
+                  const v = resultView.current;
+                  if (v) {
+                    undo(v);
+                    v.focus();
+                  }
+                  setAgentProgress({ state: "idle" });
+                }}
+              >
+                <T>Undo</T>
+              </Button>
+            )}
+            {agentProgress.state === "error" && (
+              <Button size="small" onClick={() => void executeAction("agents.mergeConflicts", { key: input.key })}>
+                <T>Retry</T>
+              </Button>
+            )}
+            {agentProgress.state !== "running" && (
+              <IconButton
+                icon="close"
+                size="small"
+                title="Dismiss"
+                onClick={() => setAgentProgress({ state: "idle" })}
+              />
+            )}
+          </div>
         </div>
       )}
       {!state || lang === null ? (
@@ -670,7 +938,8 @@ export function MergeEditor({ input }: { input: EditorInput }) {
             defaultSize="30%"
           >
             <div className={styles.paneTitle} title={yourTitle}>
-              <span className={styles.branchTitle}>{yourTitle}</span>
+              <Icon name="lock" size={12} className={styles.lockIcon} />
+              <span className={styles.branchTitle}>{renderBranchLabel(yourTitle)}</span>
               <span className={styles.sideTitle}>{tx("Your version")}</span>
             </div>
             <div
@@ -702,7 +971,8 @@ export function MergeEditor({ input }: { input: EditorInput }) {
             defaultSize="30%"
           >
             <div className={styles.paneTitle} title={theirTitle}>
-              <span className={styles.branchTitle}>{theirTitle}</span>
+              <Icon name="lock" size={12} className={styles.lockIcon} />
+              <span className={styles.branchTitle}>{renderBranchLabel(theirTitle)}</span>
               <span className={styles.sideTitle}>{tx("Their version")}</span>
             </div>
             <div
